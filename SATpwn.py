@@ -55,9 +55,8 @@ class SATpwn(plugins.Plugin):
     MODE_PROFILES = {
         'strict': 0.3, 'loose': 0.6, 'drive-by': 1.0, 'recon': 0.0, 'auto': 0.5
     }
-    BLACKLIST_ATTEMPT_THRESHOLD = 7
-    BLACKLIST_DURATION_SECONDS = 7200
-    BLACKLIST_SIGNAL_RECOVERY_DB = 10  # dBm improvement that clears a blacklist
+    AP_MIN_ATTEMPTS_FOR_SHARE = 5   # attacks before share-based rate limiting kicks in
+    AP_MIN_SHARE = 0.1              # struggling APs still get 10% of normal attack rate
 
     def __init__(self):
         self.ready = False
@@ -249,11 +248,11 @@ class SATpwn(plugins.Plugin):
             ap.setdefault('handshakes', 0)
             ap.setdefault('channel', 0)
             ap.setdefault('ssid', '')
+            ap.setdefault('total_attacks', 0)
             for client_data in ap['clients'].values():
                 if isinstance(client_data, dict):
                     client_data.setdefault('rssi_history', [])
                     client_data.setdefault('attack_attempts', 0)
-                    client_data.setdefault('blacklist_until', 0)
             cleaned[ap_mac] = ap
         return cleaned
 
@@ -380,12 +379,11 @@ class SATpwn(plugins.Plugin):
             if target_ap and target_client:
                 with self._memory_lock:
                     if ap_mac in self.memory and client_mac in self.memory[ap_mac].get('clients', {}):
+                        t = time.time()
                         cd = self.memory[ap_mac]['clients'][client_mac]
-                        cd['last_attempt'] = time.time()
+                        cd['last_attempt'] = t
                         cd['attack_attempts'] = cd.get('attack_attempts', 0) + 1
-                        if cd['attack_attempts'] >= self.BLACKLIST_ATTEMPT_THRESHOLD and cd.get('last_success', 0) == 0:
-                            cd['blacklist_until'] = time.time() + self.BLACKLIST_DURATION_SECONDS
-                            logging.info(f"[SATpwn] Soft blacklisted: {client_mac} ({cd['attack_attempts']} attempts, 0 successes)")
+                        self.memory[ap_mac]['total_attacks'] = self.memory[ap_mac].get('total_attacks', 0) + 1
                 agent.deauth(target_ap, target_client)
                 self.attack_count += 1
                 logging.info(f"[SATpwn] Attack #{self.attack_count}: {client_mac} via {ap_mac}")
@@ -498,7 +496,8 @@ class SATpwn(plugins.Plugin):
                             "channel": ap.get('channel', 0),
                             "clients": {},
                             "last_seen": now,
-                            "handshakes": 0
+                            "handshakes": 0,
+                            "total_attacks": 0
                         }
                     else:
                         mem_ap = self.memory[ap_mac]
@@ -507,7 +506,19 @@ class SATpwn(plugins.Plugin):
                         mem_ap['channel'] = ap.get('channel', 0)
                         mem_ap.setdefault('clients', {})
 
-                    ap_clients = self.memory[ap_mac]['clients']
+                    ap_mem = self.memory[ap_mac]
+                    ap_clients = ap_mem['clients']
+
+                    # Per-AP share: APs with good handshake rates get normal cooldown;
+                    # APs with many failed attempts get longer cooldowns (but never zero).
+                    ap_total_attacks = ap_mem.get('total_attacks', 0)
+                    ap_handshakes = ap_mem.get('handshakes', 0)
+                    if ap_total_attacks < self.AP_MIN_ATTEMPTS_FOR_SHARE:
+                        ap_share = 1.0
+                    else:
+                        ap_share = max(self.AP_MIN_SHARE, ap_handshakes / ap_total_attacks)
+                    ap_cooldown = cooldown / ap_share
+
                     for client in ap.get('clients', []):
                         client_mac = client['mac'].lower()
                         new_rssi = client.get('rssi', -100)
@@ -521,29 +532,18 @@ class SATpwn(plugins.Plugin):
                                 "last_success": 0,
                                 "last_recalculated": 0,
                                 "rssi_history": [new_rssi],
-                                "attack_attempts": 0,
-                                "blacklist_until": 0
+                                "attack_attempts": 0
                             }
                         else:
                             cd = ap_clients[client_mac]
-                            prev_rssi = cd.get('signal', -100)
                             cd['last_seen'] = now
                             cd['signal'] = new_rssi
                             history = cd.setdefault('rssi_history', [])
                             history.append(new_rssi)
                             if len(history) > 5:
                                 history.pop(0)
-                            # Clear blacklist if client reappears with significantly stronger signal
-                            if (cd.get('blacklist_until', 0) > now and
-                                    new_rssi > prev_rssi + self.BLACKLIST_SIGNAL_RECOVERY_DB):
-                                cd['blacklist_until'] = 0
-                                cd['attack_attempts'] = 0
-                                logging.debug(f"[SATpwn] Blacklist cleared (signal recovery): {client_mac}")
 
                         cd = ap_clients[client_mac]
-
-                        if now < cd.get('blacklist_until', 0):
-                            continue
 
                         last_recalculated = cd.get('last_recalculated', 0)
                         if last_recalculated == 0 or now - last_recalculated > recalc_interval:
@@ -557,7 +557,7 @@ class SATpwn(plugins.Plugin):
 
                         # First-ever attack skips cooldown — don't wait to discover new targets
                         is_first = cd.get('attack_attempts', 0) == 0
-                        if is_first or now - cd.get('last_attempt', 0) > cooldown:
+                        if is_first or now - cd.get('last_attempt', 0) > ap_cooldown:
                             pending_attacks.append((score, ap_mac, client_mac))
 
                 self._update_activity_history(new_ap_count, now)
@@ -598,8 +598,6 @@ class SATpwn(plugins.Plugin):
 
                     cd = self.memory[ap_mac]['clients'][client_mac]
                     cd['last_success'] = t
-                    cd['blacklist_until'] = 0
-                    cd['attack_attempts'] = 0
                     self._recalculate_client_score(ap_mac, client_mac, t)
 
                     # Collect other uncaptured clients on same AP for immediate burst attack.
@@ -609,8 +607,7 @@ class SATpwn(plugins.Plugin):
                     if effective not in ('recon',):
                         for other_mac, other_cd in self.memory[ap_mac]['clients'].items():
                             if (other_mac != client_mac and
-                                    other_cd.get('last_success', 0) == 0 and
-                                    other_cd.get('blacklist_until', 0) < t):
+                                    other_cd.get('last_success', 0) == 0):
                                 neighbor_targets.append(other_mac)
 
                 self.memory_is_dirty = True
@@ -794,10 +791,10 @@ class SATpwn(plugins.Plugin):
         now = time.time()
         total_aps = len(memory_snapshot)
         total_clients = sum(len(ap.get('clients', {})) for ap in memory_snapshot.values())
-        blacklisted_count = sum(
+        throttled_aps = sum(
             1 for ap in memory_snapshot.values()
-            for cd in ap.get('clients', {}).values()
-            if now < cd.get('blacklist_until', 0)
+            if ap.get('total_attacks', 0) >= self.AP_MIN_ATTEMPTS_FOR_SHARE and
+               ap.get('handshakes', 0) / ap.get('total_attacks', 1) < 0.5
         )
         success_rate = (self.attack_success_count / max(self.attack_count, 1) * 100) if self.attack_count > 0 else 0
 
@@ -811,7 +808,7 @@ class SATpwn(plugins.Plugin):
         channel_html += "</table>"
 
         # Generate AP memory table sorted by highest client score
-        memory_html = "<table><tr><th>AP</th><th>Ch</th><th>Clients</th><th>Max Score</th></tr>"
+        memory_html = "<table><tr><th>AP</th><th>Ch</th><th>Clients</th><th>Max Score</th><th>Share</th></tr>"
         if memory_snapshot:
             sorted_aps = sorted(
                 memory_snapshot.items(),
@@ -826,11 +823,18 @@ class SATpwn(plugins.Plugin):
                 max_score = 0
                 if ap_data.get('clients'):
                     max_score = max(client.get('score', 0) for client in ap_data['clients'].values())
-                memory_html += f"<tr><td>{ap_data.get('ssid', 'N/A')}<br><small>{ap_mac[:17]}</small></td><td>{ap_data.get('channel', '-')}</td><td>{client_count}</td><td>{max_score:.1f}</td></tr>"
+                atk = ap_data.get('total_attacks', 0)
+                hs = ap_data.get('handshakes', 0)
+                if atk < self.AP_MIN_ATTEMPTS_FOR_SHARE:
+                    share_str = "new"
+                else:
+                    share_val = max(self.AP_MIN_SHARE, hs / atk)
+                    share_str = f"{share_val*100:.0f}%"
+                memory_html += f"<tr><td>{ap_data.get('ssid', 'N/A')}<br><small>{ap_mac[:17]}</small></td><td>{ap_data.get('channel', '-')}</td><td>{client_count}</td><td>{max_score:.1f}</td><td>{share_str}</td></tr>"
             if len(memory_snapshot) > self.DASHBOARD_MAX_APS:
-                memory_html += f"<tr><td colspan='4'><i>+{len(memory_snapshot) - self.DASHBOARD_MAX_APS} more</i></td></tr>"
+                memory_html += f"<tr><td colspan='5'><i>+{len(memory_snapshot) - self.DASHBOARD_MAX_APS} more</i></td></tr>"
         else:
-            memory_html += "<tr><td colspan='4'>No APs yet</td></tr>"
+            memory_html += "<tr><td colspan='5'>No APs yet</td></tr>"
         memory_html += "</table>"
 
         # Mode button
@@ -886,7 +890,7 @@ class SATpwn(plugins.Plugin):
         <p><b>Clients:</b> {total_clients}</p>
         <p><b>Attacks:</b> {self.attack_count}</p>
         <p><b>Success:</b> {success_rate:.1f}%</p>
-        <p><b>Blacklisted:</b> {blacklisted_count}</p>
+        <p><b>Throttled APs:</b> {throttled_aps}</p>
         </div>
 
         <div class="card">
