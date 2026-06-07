@@ -3,7 +3,7 @@ import threading
 import pwnagotchi.plugins as plugins
 import pwnagotchi.ui.components as components
 import pwnagotchi.ui.view as view
-from flask import Response
+from flask import Response, request
 import random
 import json
 import os
@@ -50,6 +50,12 @@ class SATpwn(plugins.Plugin):
     EXECUTOR_MAX_WORKERS = 3
     MEMORY_SAVE_INTERVAL_SECONDS = 300
 
+    MODE_PROFILES = {
+        'strict': 0.0, 'loose': 0.35, 'drive-by': 1.0, 'recon': 0.0, 'auto': 0.35
+    }
+    BLACKLIST_ATTEMPT_THRESHOLD = 10
+    BLACKLIST_DURATION_SECONDS = 7200
+
     def __init__(self):
         self.ready = False
         self.agent = None
@@ -70,6 +76,8 @@ class SATpwn(plugins.Plugin):
         self._current_auto_submode = None
         self._stationary_start = None
         self._last_saved = 0
+        self.aggression = 0.0
+        self._base_aggression = 0.0
 
         self.plugin_enabled = True
 
@@ -197,6 +205,15 @@ class SATpwn(plugins.Plugin):
             return 'drive-by'
         return 'loose' if len(self.memory) < 10 else 'strict'
 
+    def _effective_threshold(self):
+        return 5.0 + (20.0 - 5.0) * (1.0 - self.aggression)
+
+    def _effective_cooldown(self):
+        return 30.0 + (90.0 - 30.0) * (1.0 - self.aggression)
+
+    def _effective_exploration(self):
+        return 0.05 + (0.20 - 0.05) * self.aggression
+
     def _save_memory(self):
         """Persist plugin state and AP/client memory to disk."""
         try:
@@ -208,7 +225,9 @@ class SATpwn(plugins.Plugin):
                     "stationary_start": self._stationary_start,
                     "plugin_enabled": self.plugin_enabled,
                     "attack_count": self.attack_count,
-                    "attack_success_count": self.attack_success_count
+                    "attack_success_count": self.attack_success_count,
+                    "aggression": self.aggression,
+                    "base_aggression": self._base_aggression
                 },
                 "ap_data": self.memory
             }
@@ -234,6 +253,11 @@ class SATpwn(plugins.Plugin):
             ap.setdefault('handshakes', 0)
             ap.setdefault('channel', 0)
             ap.setdefault('ssid', '')
+            for client_data in ap['clients'].values():
+                if isinstance(client_data, dict):
+                    client_data.setdefault('rssi_history', [])
+                    client_data.setdefault('attack_attempts', 0)
+                    client_data.setdefault('blacklist_until', 0)
             cleaned[ap_mac] = ap
         return cleaned
 
@@ -255,6 +279,8 @@ class SATpwn(plugins.Plugin):
                     self._stationary_start = metadata.get("stationary_start", None)
                     self.attack_count = metadata.get("attack_count", 0)
                     self.attack_success_count = metadata.get("attack_success_count", 0)
+                    self.aggression = metadata.get("aggression", self.MODE_PROFILES.get(self.mode, 0.0))
+                    self._base_aggression = metadata.get("base_aggression", self.aggression)
                 else:
                     self.memory = self._validate_memory_schema(data)
                     self.mode = self.modes[0]
@@ -316,6 +342,12 @@ class SATpwn(plugins.Plugin):
         decay_amount = age_hours * self.SCORE_DECAY_PENALTY_PER_HOUR
         score = max(0, score - decay_amount)
 
+        # RSSI trend bonus: approaching clients get priority, departing get penalty
+        history = client_data.get('rssi_history', [])
+        if len(history) >= 2:
+            trend = history[-1] - history[0]
+            score = max(0, score + max(-15.0, min(15.0, trend * 1.5)))
+
         client_data['score'] = score
         return score
 
@@ -358,7 +390,12 @@ class SATpwn(plugins.Plugin):
             if target_ap and target_client:
                 with self._memory_lock:
                     if ap_mac in self.memory and client_mac in self.memory[ap_mac].get('clients', {}):
-                        self.memory[ap_mac]['clients'][client_mac]['last_attempt'] = time.time()
+                        cd = self.memory[ap_mac]['clients'][client_mac]
+                        cd['last_attempt'] = time.time()
+                        cd['attack_attempts'] = cd.get('attack_attempts', 0) + 1
+                        if cd['attack_attempts'] >= self.BLACKLIST_ATTEMPT_THRESHOLD and cd.get('last_success', 0) == 0:
+                            cd['blacklist_until'] = time.time() + self.BLACKLIST_DURATION_SECONDS
+                            logging.info(f"[SATpwn] Soft blacklisted: {client_mac} ({cd['attack_attempts']} attempts, 0 successes)")
                 agent.deauth(target_ap, target_client)
                 self.attack_count += 1
                 logging.info(f"[SATpwn] Attack #{self.attack_count}: {client_mac} via {ap_mac}")
@@ -484,10 +521,13 @@ class SATpwn(plugins.Plugin):
                                 "last_recalculated": 0
                             }
                         else:
-                            self.memory[ap_mac]['clients'][client_mac].update({
-                                'last_seen': now,
-                                'signal': client.get('rssi', -100)
-                            })
+                            new_rssi = client.get('rssi', -100)
+                            cd = self.memory[ap_mac]['clients'][client_mac]
+                            cd.update({'last_seen': now, 'signal': new_rssi})
+                            history = cd.setdefault('rssi_history', [])
+                            history.append(new_rssi)
+                            if len(history) > 5:
+                                history.pop(0)
 
                         client_data = self.memory[ap_mac]['clients'][client_mac]
 
@@ -500,16 +540,13 @@ class SATpwn(plugins.Plugin):
                         else:
                             score = client_data.get('score', 0)
 
-                        # Determine attack thresholds based on current mode
                         last_attempt = client_data.get('last_attempt', 0)
-                        attack_score_threshold = (self.DRIVE_BY_ATTACK_SCORE_THRESHOLD
-                                                  if self.mode == 'drive-by'
-                                                  else self.ATTACK_SCORE_THRESHOLD)
-                        attack_cooldown = (self.DRIVE_BY_ATTACK_COOLDOWN_SECONDS
-                                           if self.mode == 'drive-by'
-                                           else self.ATTACK_COOLDOWN_SECONDS)
 
-                        if score >= attack_score_threshold and (now - last_attempt > attack_cooldown):
+                        # Skip soft-blacklisted clients
+                        if now < client_data.get('blacklist_until', 0):
+                            continue
+
+                        if score >= self._effective_threshold() and (now - last_attempt > self._effective_cooldown()):
                             pending_attacks.append((ap_mac, client_mac))
 
                 self._update_activity_history(new_ap_count)
@@ -543,7 +580,10 @@ class SATpwn(plugins.Plugin):
                         self.attack_success_count += 1
                         logging.info(f"[SATpwn] Success! {self.attack_success_count}/{self.attack_count}")
 
-                    self.memory[ap_mac]['clients'][client_mac]['last_success'] = time.time()
+                    cd = self.memory[ap_mac]['clients'][client_mac]
+                    cd['last_success'] = time.time()
+                    cd['blacklist_until'] = 0
+                    cd['attack_attempts'] = 0
                     self._recalculate_client_score(ap_mac, client_mac)
 
                 self.memory_is_dirty = True
@@ -551,16 +591,15 @@ class SATpwn(plugins.Plugin):
         except Exception as e:
             logging.error(f"[SATpwn] Handshake processing error: {e}")
 
-    def _epoch_strict(self, agent, epoch, epoch_data, supported_channels):
-        """Strict mode: weighted channel selection prioritizing active channels."""
+    def _epoch_weighted(self, agent, supported_channels):
+        """Weighted channel selection prioritizing active channels, used by all non-recon modes."""
         if self.memory_is_dirty or not self.channel_stats:
             self.channel_stats = self._get_channel_stats()
             self.memory_is_dirty = False
 
         channels = list(self.channel_stats.keys())
         if not channels:
-            next_channel = random.choice(supported_channels)
-            agent.set_channel(next_channel)
+            agent.set_channel(random.choice(supported_channels))
             return
 
         # Calculate channel weights based on activity
@@ -580,36 +619,14 @@ class SATpwn(plugins.Plugin):
                 supported_channels_with_weights.append(ch)
                 supported_weights.append(weights[i])
 
-        # Select next channel using weighted random selection
         if not supported_channels_with_weights:
-            next_channel = random.choice(supported_channels)
+            agent.set_channel(random.choice(supported_channels))
         else:
             total_weight = sum(supported_weights)
             if total_weight == 0:
-                next_channel = random.choice(supported_channels_with_weights)
+                agent.set_channel(random.choice(supported_channels_with_weights))
             else:
-                next_channel = random.choices(supported_channels_with_weights, weights=supported_weights, k=1)[0]
-
-        agent.set_channel(next_channel)
-
-    def _epoch_loose(self, agent, epoch, epoch_data, supported_channels):
-        """Loose mode: strict mode with 10% exploration probability."""
-        if self.memory_is_dirty or not self.channel_stats:
-            self.channel_stats = self._get_channel_stats()
-            self.memory_is_dirty = False
-
-        # 10% chance to explore random channel
-        if random.random() < self.EXPLORATION_PROBABILITY:
-            next_channel = random.choice(supported_channels)
-            agent.set_channel(next_channel)
-            return
-
-        # Otherwise use strict weighted selection
-        self._epoch_strict(agent, epoch, epoch_data, supported_channels)
-
-    def _epoch_driveby(self, agent, epoch, epoch_data, supported_channels):
-        """Drive-by mode: strict logic with aggressive timing constants."""
-        self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+                agent.set_channel(random.choices(supported_channels_with_weights, weights=supported_weights, k=1)[0])
 
     def _epoch_recon(self, agent, epoch, epoch_data, supported_channels):
         """Recon mode: systematic channel survey without attacks."""
@@ -619,7 +636,7 @@ class SATpwn(plugins.Plugin):
 
         if len(self.recon_channels_tested) >= len(supported_channels):
             # Survey complete, switch to strict targeting
-            self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+            self._epoch_weighted(agent, supported_channels)
             return
 
         try:
@@ -631,9 +648,9 @@ class SATpwn(plugins.Plugin):
                     self.recon_channels_tested.append(next_channel)
                     agent.set_channel(next_channel)
                     return
-            self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+            self._epoch_weighted(agent, supported_channels)
         except StopIteration:
-            self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+            self._epoch_weighted(agent, supported_channels)
 
     def on_epoch(self, agent, epoch, epoch_data):
         """Called each epoch for channel hopping and memory management."""
@@ -650,26 +667,22 @@ class SATpwn(plugins.Plugin):
             if not supported_channels:
                 return
 
-            # Route to appropriate mode handler
+            # Resolve effective mode (auto picks a sub-mode based on environment)
+            effective_mode = self.mode
             if self.mode == 'auto':
-                sub_mode = self._auto_mode_logic()
-                self._current_auto_submode = sub_mode
-                if sub_mode == 'recon':
-                    self._epoch_recon(agent, epoch, epoch_data, supported_channels)
-                elif sub_mode == 'drive-by':
-                    self._epoch_driveby(agent, epoch, epoch_data, supported_channels)
-                elif sub_mode == 'loose':
-                    self._epoch_loose(agent, epoch, epoch_data, supported_channels)
-                else:
-                    self._epoch_strict(agent, epoch, epoch_data, supported_channels)
-            elif self.mode == 'loose':
-                self._epoch_loose(agent, epoch, epoch_data, supported_channels)
-            elif self.mode == 'drive-by':
-                self._epoch_driveby(agent, epoch, epoch_data, supported_channels)
-            elif self.mode == 'recon':
+                effective_mode = self._auto_mode_logic()
+                self._current_auto_submode = effective_mode
+                # In auto mode, also update aggression to match sub-mode profile
+                target_aggression = self.MODE_PROFILES.get(effective_mode, 0.35)
+                self.aggression = self._base_aggression + (target_aggression - self._base_aggression) * 0.2
+
+            if effective_mode == 'recon':
                 self._epoch_recon(agent, epoch, epoch_data, supported_channels)
             else:
-                self._epoch_strict(agent, epoch, epoch_data, supported_channels)
+                if random.random() < self._effective_exploration():
+                    agent.set_channel(random.choice(supported_channels))
+                else:
+                    self._epoch_weighted(agent, supported_channels)
 
         except Exception as e:
             logging.error(f"[SATpwn] Epoch error: {e}")
@@ -685,6 +698,8 @@ class SATpwn(plugins.Plugin):
                 next_index = (current_index + 1) % len(self.modes)
                 old_mode = self.mode
                 self.mode = self.modes[next_index]
+                self.aggression = self.MODE_PROFILES.get(self.mode, 0.0)
+                self._base_aggression = self.aggression
 
                 # Reset mode-specific state
                 if self.mode == 'recon':
@@ -694,10 +709,23 @@ class SATpwn(plugins.Plugin):
                     self._current_auto_submode = None
 
                 self._save_memory()
-                logging.info(f"[SATpwn] Mode: {old_mode} → {self.mode}")
+                self._last_saved = time.time()
+                logging.info(f"[SATpwn] Mode: {old_mode} → {self.mode} (aggression={self.aggression:.2f})")
             except Exception as e:
                 logging.error(f"[SATpwn] Mode toggle error: {e}")
 
+            return Response('<html><head><meta http-equiv="refresh" content="0; url=/plugins/SATpwn/" /></head></html>', mimetype='text/html')
+
+        if path == 'set_aggression':
+            if self.plugin_enabled:
+                try:
+                    val = float(request.form.get('aggression', self.aggression))
+                    self.aggression = max(0.0, min(1.0, val))
+                    self._save_memory()
+                    self._last_saved = time.time()
+                    logging.info(f"[SATpwn] Aggression set to {self.aggression:.2f}")
+                except (ValueError, TypeError):
+                    pass
             return Response('<html><head><meta http-equiv="refresh" content="0; url=/plugins/SATpwn/" /></head></html>', mimetype='text/html')
 
         if path == '/' or not path:
@@ -736,8 +764,14 @@ class SATpwn(plugins.Plugin):
             memory_snapshot = dict(self.memory)
             channel_stats_snapshot = dict(self.channel_stats)
 
+        now = time.time()
         total_aps = len(memory_snapshot)
         total_clients = sum(len(ap.get('clients', {})) for ap in memory_snapshot.values())
+        blacklisted_count = sum(
+            1 for ap in memory_snapshot.values()
+            for cd in ap.get('clients', {}).values()
+            if now < cd.get('blacklist_until', 0)
+        )
         success_rate = (self.attack_success_count / max(self.attack_count, 1) * 100) if self.attack_count > 0 else 0
 
         # Generate channel stats table
@@ -795,10 +829,6 @@ class SATpwn(plugins.Plugin):
             total = len(self.agent.supported_channels()) if self.agent else 0
             recon_status = f"<p><b>Progress:</b> {tested}/{total}</p>"
 
-        # Show attack thresholds for current mode
-        current_threshold = self.DRIVE_BY_ATTACK_SCORE_THRESHOLD if self.mode == 'drive-by' else self.ATTACK_SCORE_THRESHOLD
-        current_cooldown = self.DRIVE_BY_ATTACK_COOLDOWN_SECONDS if self.mode == 'drive-by' else self.ATTACK_COOLDOWN_SECONDS
-
         html = f"""
         <html>
         <head><title>SATpwn v{self.__version__}</title>
@@ -831,20 +861,28 @@ class SATpwn(plugins.Plugin):
         <p><b>Clients:</b> {total_clients}</p>
         <p><b>Attacks:</b> {self.attack_count}</p>
         <p><b>Success:</b> {success_rate:.1f}%</p>
+        <p><b>Blacklisted:</b> {blacklisted_count}</p>
         </div>
-        
+
         <div class="card">
         <h2>Mode: {self.mode.upper()}</h2>
-        <p class="threshold"><b>Threshold:</b> {current_threshold}</p>
-        <p class="threshold"><b>Cooldown:</b> {current_cooldown}s</p>
+        <p class="threshold"><b>Threshold:</b> {self._effective_threshold():.1f}</p>
+        <p class="threshold"><b>Cooldown:</b> {self._effective_cooldown():.0f}s</p>
         {recon_status}
         {mode_button}
+        <form method="POST" action="/plugins/SATpwn/set_aggression" style="margin-top:10px;">
+        <label><b>Aggression:</b> {self.aggression:.2f}</label><br>
+        <input type="range" name="aggression" min="0" max="1" step="0.05"
+               value="{self.aggression:.2f}" style="width:100%;margin:4px 0;">
+        <input type="submit" value="Apply" style="padding:4px 10px;background:#569cd6;color:#fff;border:none;border-radius:3px;cursor:pointer;">
+        </form>
         </div>
-        
+
         <div class="card">
         <h2>Status</h2>
-        <p><b>Rate Limit:</b> <span style="color:#00ff00;">DISABLED</span></p>
-        <p><b>Thread Pool:</b> 3 workers</p>
+        <p><b>Thread Pool:</b> {self.EXECUTOR_MAX_WORKERS} workers</p>
+        <p><b>Exploration:</b> {self._effective_exploration()*100:.0f}%</p>
+        <p><b>Base Aggression:</b> {self._base_aggression:.2f}</p>
         </div>
         </div>
         
