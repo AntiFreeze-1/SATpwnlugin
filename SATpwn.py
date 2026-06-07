@@ -802,10 +802,10 @@ class SATpwn(plugins.Plugin):
         success_rate = (self.attack_success_count / max(self.attack_count, 1) * 100) if self.attack_count > 0 else 0
 
         # Generate channel stats table
-        channel_html = "<table><tr><th>Ch</th><th>APs</th><th>Clients</th><th>Handshakes</th></tr>"
+        channel_html = "<table><tr><th>Ch</th><th>APs</th><th>Uncaptured</th><th>Handshakes</th></tr>"
         if channel_stats_snapshot:
             for ch, stats in sorted(channel_stats_snapshot.items()):
-                channel_html += f"<tr><td>{ch}</td><td>{stats['aps']}</td><td>{stats['clients']}</td><td>{stats['handshakes']}</td></tr>"
+                channel_html += f"<tr><td>{ch}</td><td>{stats.get('aps', 0)}</td><td>{stats.get('uncaptured', 0)}</td><td>{stats.get('handshakes', 0)}</td></tr>"
         else:
             channel_html += "<tr><td colspan='4'>Gathering data...</td></tr>"
         channel_html += "</table>"
