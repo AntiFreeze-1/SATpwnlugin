@@ -3,7 +3,7 @@ import threading
 import pwnagotchi.plugins as plugins
 import pwnagotchi.ui.components as components
 import pwnagotchi.ui.view as view
-from flask import Response, request
+from flask import Response
 import random
 import json
 import os
@@ -78,6 +78,8 @@ class SATpwn(plugins.Plugin):
         self._last_saved = 0
         self.aggression = 0.0
         self._base_aggression = 0.0
+        self._recent_activity = 0  # cached sum, updated in _update_activity_history
+        self._current_submode = None  # cached per-epoch sub-mode for thread use
 
         self.plugin_enabled = True
 
@@ -151,36 +153,27 @@ class SATpwn(plugins.Plugin):
             self.home_whitelist = set()
             self.plugin_enabled = True
 
-    def _update_activity_history(self, new_ap_count):
+    def _update_activity_history(self, new_ap_count, now):
         """Track new AP discoveries for movement detection."""
-        now = time.time()
         self._activity_history.append((now, new_ap_count))
         cutoff = now - self.ACTIVITY_WINDOW_SECONDS
-        self._activity_history = [(t, count) for t, count in self._activity_history if t > cutoff]
+        self._activity_history = [(t, c) for t, c in self._activity_history if t > cutoff]
+        self._recent_activity = sum(c for _, c in self._activity_history)
 
     def _is_stationary(self):
         """Detect if device has been stationary for extended period."""
-        now = time.time()
-        recent_activity = sum(count for t, count in self._activity_history 
-                             if now - t <= self.ACTIVITY_WINDOW_SECONDS)
-        low_activity = recent_activity < self.ACTIVITY_THRESHOLD
-
-        if low_activity:
+        if self._recent_activity < self.ACTIVITY_THRESHOLD:
+            now = time.time()
             if self._stationary_start is None:
                 self._stationary_start = now
-            elapsed = now - self._stationary_start
-            return elapsed >= self.STATIONARY_SECONDS
-        else:
-            if self._stationary_start is not None:
-                self._stationary_start = None
-            return False
+            return (now - self._stationary_start) >= self.STATIONARY_SECONDS
+        if self._stationary_start is not None:
+            self._stationary_start = None
+        return False
 
     def _is_moving(self):
         """Detect if device is moving based on AP discovery rate."""
-        now = time.time()
-        recent_activity = sum(count for t, count in self._activity_history 
-                             if now - t <= self.ACTIVITY_WINDOW_SECONDS)
-        return recent_activity >= self.ACTIVITY_THRESHOLD
+        return self._recent_activity >= self.ACTIVITY_THRESHOLD
 
     def _home_ssid_visible(self):
         """Check if any whitelisted home SSID/BSSID is visible."""
@@ -233,7 +226,7 @@ class SATpwn(plugins.Plugin):
             }
 
             with open(self.memory_path, 'w') as f:
-                json.dump(memory_data, f, indent=2)
+                json.dump(memory_data, f)
         except Exception as e:
             logging.error(f"[SATpwn] Error saving memory: {e}")
 
@@ -296,72 +289,58 @@ class SATpwn(plugins.Plugin):
         else:
             logging.info("[SATpwn] No existing memory file found")
 
-    def _cleanup_memory(self):
+    def _cleanup_memory(self, now):
         """Remove expired APs and clients based on mode-specific expiry times."""
         if not self.plugin_enabled:
             return
 
-        self.memory_is_dirty = True
-        now = time.time()
-        
-        # Use mode-specific expiry values for efficiency
-        ap_expiry = self.DRIVE_BY_AP_EXPIRY_SECONDS if self.mode == 'drive-by' else self.AP_EXPIRY_SECONDS
-        client_expiry = self.DRIVE_BY_CLIENT_EXPIRY_SECONDS if self.mode == 'drive-by' else self.CLIENT_EXPIRY_SECONDS
+        drive_by = self.mode == 'drive-by'
+        ap_expiry = self.DRIVE_BY_AP_EXPIRY_SECONDS if drive_by else self.AP_EXPIRY_SECONDS
+        client_expiry = self.DRIVE_BY_CLIENT_EXPIRY_SECONDS if drive_by else self.CLIENT_EXPIRY_SECONDS
 
-        # Remove expired APs
-        expired_aps = [ap_mac for ap_mac, data in self.memory.items()
+        expired_aps = [mac for mac, data in self.memory.items()
                        if now - data.get("last_seen", 0) > ap_expiry]
-        for ap_mac in expired_aps:
-            if ap_mac in self.memory:
-                del self.memory[ap_mac]
+        for mac in expired_aps:
+            del self.memory[mac]
 
-        # Remove expired clients from remaining APs
-        for ap_mac in list(self.memory.keys()):
-            clients = self.memory[ap_mac].get("clients", {})
-            expired_clients = [client_mac for client_mac, data in clients.items()
-                               if now - data.get("last_seen", 0) > client_expiry]
-            for client_mac in expired_clients:
-                if client_mac in clients:
-                    del clients[client_mac]
+        any_client_removed = False
+        for ap_data in self.memory.values():
+            clients = ap_data.get("clients", {})
+            expired = [c for c, d in clients.items() if now - d.get("last_seen", 0) > client_expiry]
+            for c in expired:
+                del clients[c]
+                any_client_removed = True
 
-    def _recalculate_client_score(self, ap_mac, client_mac):
+        if expired_aps or any_client_removed:
+            self.memory_is_dirty = True
+
+    def _recalculate_client_score(self, ap_mac, client_mac, now):
         """Calculate client attack priority score with proper signal strength bounds."""
         client_data = self.memory[ap_mac]['clients'][client_mac]
-        
-        # Base score from signal strength with proper bounds (0-100)
-        signal = client_data.get('signal', -100)
-        base_score = max(0, min(100, signal + 100))
-        score = base_score
 
-        # Bonus for recently successful targets
-        if client_data.get('last_success', 0) > time.time() - self.SUCCESS_BONUS_DURATION_SECONDS:
+        score = max(0, min(100, client_data.get('signal', -100) + 100))
+
+        if client_data.get('last_success', 0) > now - self.SUCCESS_BONUS_DURATION_SECONDS:
             score += 50
 
-        # Age decay - penalize stale targets
-        age_hours = (time.time() - client_data.get('last_seen', time.time())) / 3600
-        decay_amount = age_hours * self.SCORE_DECAY_PENALTY_PER_HOUR
-        score = max(0, score - decay_amount)
+        age_hours = (now - client_data.get('last_seen', now)) / 3600
+        score = max(0.0, score - age_hours * self.SCORE_DECAY_PENALTY_PER_HOUR)
 
-        # RSSI trend bonus: approaching clients get priority, departing get penalty
         history = client_data.get('rssi_history', [])
         if len(history) >= 2:
-            trend = history[-1] - history[0]
-            score = max(0, score + max(-15.0, min(15.0, trend * 1.5)))
+            score = max(0.0, score + max(-15.0, min(15.0, (history[-1] - history[0]) * 1.5)))
 
         client_data['score'] = score
         return score
 
-    def _execute_attack(self, agent, ap_mac, client_mac):
+    def _execute_attack(self, agent, ap_mac, client_mac, submode=None):
         """Execute deauth attack on target - no artificial rate limiting."""
         if not self.plugin_enabled:
             return
 
-        # Skip attacks in recon modes
-        if self.mode == 'auto':
-            sub_mode = self._auto_mode_logic()
-            if sub_mode == 'recon':
-                return
-        elif self.mode == 'recon':
+        # Skip attacks in recon modes (use cached submode from epoch to avoid re-computing)
+        effective = submode if self.mode == 'auto' else self.mode
+        if effective == 'recon':
             return
 
         try:
@@ -486,6 +465,10 @@ class SATpwn(plugins.Plugin):
         now = time.time()
         new_ap_count = 0
         pending_attacks = []
+        # Pre-compute per-scan constants to avoid per-client method call overhead
+        threshold = self._effective_threshold()
+        cooldown = self._effective_cooldown()
+        recalc_interval = self.SCORE_RECALCULATION_INTERVAL_SECONDS
 
         try:
             with self._memory_lock:
@@ -501,60 +484,60 @@ class SATpwn(plugins.Plugin):
                             "handshakes": 0
                         }
                     else:
-                        self.memory[ap_mac].update({
-                            'last_seen': now,
-                            'ssid': ap.get('hostname', ''),
-                            'channel': ap.get('channel', 0)
-                        })
-                        self.memory[ap_mac].setdefault('clients', {})
+                        mem_ap = self.memory[ap_mac]
+                        mem_ap['last_seen'] = now
+                        mem_ap['ssid'] = ap.get('hostname', '')
+                        mem_ap['channel'] = ap.get('channel', 0)
+                        mem_ap.setdefault('clients', {})
 
+                    ap_clients = self.memory[ap_mac]['clients']
                     for client in ap.get('clients', []):
                         client_mac = client['mac'].lower()
+                        new_rssi = client.get('rssi', -100)
 
-                        if client_mac not in self.memory[ap_mac]['clients']:
-                            self.memory[ap_mac]['clients'][client_mac] = {
+                        if client_mac not in ap_clients:
+                            ap_clients[client_mac] = {
                                 "last_seen": now,
-                                "signal": client.get('rssi', -100),
+                                "signal": new_rssi,
                                 "score": 0,
                                 "last_attempt": 0,
                                 "last_success": 0,
-                                "last_recalculated": 0
+                                "last_recalculated": 0,
+                                "rssi_history": [new_rssi],
+                                "attack_attempts": 0,
+                                "blacklist_until": 0
                             }
                         else:
-                            new_rssi = client.get('rssi', -100)
-                            cd = self.memory[ap_mac]['clients'][client_mac]
-                            cd.update({'last_seen': now, 'signal': new_rssi})
+                            cd = ap_clients[client_mac]
+                            cd['last_seen'] = now
+                            cd['signal'] = new_rssi
                             history = cd.setdefault('rssi_history', [])
                             history.append(new_rssi)
                             if len(history) > 5:
                                 history.pop(0)
 
-                        client_data = self.memory[ap_mac]['clients'][client_mac]
+                        cd = ap_clients[client_mac]
 
-                        # Force recalculation if score was never set, otherwise throttle
-                        last_recalculated = client_data.get('last_recalculated', 0)
-                        if last_recalculated == 0 or client_data.get('score') is None or \
-                                now - last_recalculated > self.SCORE_RECALCULATION_INTERVAL_SECONDS:
-                            score = self._recalculate_client_score(ap_mac, client_mac)
-                            client_data['last_recalculated'] = now
-                        else:
-                            score = client_data.get('score', 0)
-
-                        last_attempt = client_data.get('last_attempt', 0)
-
-                        # Skip soft-blacklisted clients
-                        if now < client_data.get('blacklist_until', 0):
+                        if now < cd.get('blacklist_until', 0):
                             continue
 
-                        if score >= self._effective_threshold() and (now - last_attempt > self._effective_cooldown()):
+                        last_recalculated = cd.get('last_recalculated', 0)
+                        if last_recalculated == 0 or now - last_recalculated > recalc_interval:
+                            score = self._recalculate_client_score(ap_mac, client_mac, now)
+                            cd['last_recalculated'] = now
+                        else:
+                            score = cd.get('score', 0)
+
+                        if score >= threshold and now - cd.get('last_attempt', 0) > cooldown:
                             pending_attacks.append((ap_mac, client_mac))
 
-                self._update_activity_history(new_ap_count)
+                self._update_activity_history(new_ap_count, now)
                 self.memory_is_dirty = True
 
             # Submit attacks outside the lock so threads don't contend on acquisition
+            submode = self._current_submode
             for ap_mac, client_mac in pending_attacks:
-                self.executor.submit(self._execute_attack, agent, ap_mac, client_mac)
+                self.executor.submit(self._execute_attack, agent, ap_mac, client_mac, submode)
 
         except Exception as e:
             logging.error(f"[SATpwn] WiFi update error: {e}")
@@ -580,11 +563,12 @@ class SATpwn(plugins.Plugin):
                         self.attack_success_count += 1
                         logging.info(f"[SATpwn] Success! {self.attack_success_count}/{self.attack_count}")
 
+                    t = time.time()
                     cd = self.memory[ap_mac]['clients'][client_mac]
-                    cd['last_success'] = time.time()
+                    cd['last_success'] = t
                     cd['blacklist_until'] = 0
                     cd['attack_attempts'] = 0
-                    self._recalculate_client_score(ap_mac, client_mac)
+                    self._recalculate_client_score(ap_mac, client_mac, t)
 
                 self.memory_is_dirty = True
 
@@ -658,23 +642,26 @@ class SATpwn(plugins.Plugin):
             return
 
         try:
-            self._cleanup_memory()
-            if time.time() - self._last_saved > self.MEMORY_SAVE_INTERVAL_SECONDS:
+            now = time.time()
+            self._cleanup_memory(now)
+            if now - self._last_saved > self.MEMORY_SAVE_INTERVAL_SECONDS:
                 self._save_memory()
-                self._last_saved = time.time()
+                self._last_saved = now
 
             supported_channels = agent.supported_channels()
             if not supported_channels:
                 return
 
-            # Resolve effective mode (auto picks a sub-mode based on environment)
-            effective_mode = self.mode
+            # Resolve effective mode and cache for use by attack threads this epoch
             if self.mode == 'auto':
                 effective_mode = self._auto_mode_logic()
                 self._current_auto_submode = effective_mode
-                # In auto mode, also update aggression to match sub-mode profile
+                self._current_submode = effective_mode
                 target_aggression = self.MODE_PROFILES.get(effective_mode, 0.35)
                 self.aggression = self._base_aggression + (target_aggression - self._base_aggression) * 0.2
+            else:
+                effective_mode = self.mode
+                self._current_submode = self.mode
 
             if effective_mode == 'recon':
                 self._epoch_recon(agent, epoch, epoch_data, supported_channels)
@@ -714,18 +701,6 @@ class SATpwn(plugins.Plugin):
             except Exception as e:
                 logging.error(f"[SATpwn] Mode toggle error: {e}")
 
-            return Response('<html><head><meta http-equiv="refresh" content="0; url=/plugins/SATpwn/" /></head></html>', mimetype='text/html')
-
-        if path == 'set_aggression':
-            if self.plugin_enabled:
-                try:
-                    val = float(request.form.get('aggression', self.aggression))
-                    self.aggression = max(0.0, min(1.0, val))
-                    self._save_memory()
-                    self._last_saved = time.time()
-                    logging.info(f"[SATpwn] Aggression set to {self.aggression:.2f}")
-                except (ValueError, TypeError):
-                    pass
             return Response('<html><head><meta http-equiv="refresh" content="0; url=/plugins/SATpwn/" /></head></html>', mimetype='text/html')
 
         if path == '/' or not path:
@@ -818,9 +793,7 @@ class SATpwn(plugins.Plugin):
             stationary = self._is_stationary()
             moving = self._is_moving()
             sub = self._current_auto_submode or "..."
-            activity = sum(count for t, count in self._activity_history 
-                          if time.time() - t <= self.ACTIVITY_WINDOW_SECONDS)
-            auto_status = f"<p><b>Sub:</b> {sub.upper()}</p><p><b>Activity:</b> {activity}/5min</p><p><b>Home:</b> {'✓' if home else '✗'} <b>Moving:</b> {'✓' if moving else '✗'}</p>"
+            auto_status = f"<p><b>Sub:</b> {sub.upper()}</p><p><b>Activity:</b> {self._recent_activity}/5min</p><p><b>Home:</b> {'✓' if home else '✗'} <b>Moving:</b> {'✓' if moving else '✗'}</p>"
 
         # Recon status
         recon_status = ""
@@ -868,14 +841,9 @@ class SATpwn(plugins.Plugin):
         <h2>Mode: {self.mode.upper()}</h2>
         <p class="threshold"><b>Threshold:</b> {self._effective_threshold():.1f}</p>
         <p class="threshold"><b>Cooldown:</b> {self._effective_cooldown():.0f}s</p>
+        <p><b>Aggression:</b> {self.aggression:.2f}</p>
         {recon_status}
         {mode_button}
-        <form method="POST" action="/plugins/SATpwn/set_aggression" style="margin-top:10px;">
-        <label><b>Aggression:</b> {self.aggression:.2f}</label><br>
-        <input type="range" name="aggression" min="0" max="1" step="0.05"
-               value="{self.aggression:.2f}" style="width:100%;margin:4px 0;">
-        <input type="submit" value="Apply" style="padding:4px 10px;background:#569cd6;color:#fff;border:none;border-radius:3px;cursor:pointer;">
-        </form>
         </div>
 
         <div class="card">
