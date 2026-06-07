@@ -1,4 +1,5 @@
 import logging
+import threading
 import pwnagotchi.plugins as plugins
 import pwnagotchi.ui.components as components
 import pwnagotchi.ui.view as view
@@ -17,7 +18,7 @@ except ImportError:
         import toml as tomllib
 
 class SATpwn(plugins.Plugin):
-    __author__ = 'Renmeii x Mr-Cass-Ette and discoJack too '
+    __author__ = 'Renmeii x Mr-Cass-Ette and discoJack too'
     __version__ = '88.0.5'
     __license__ = 'GPL3'
     __description__ = 'SATpwn intelligent targeting system'
@@ -44,13 +45,19 @@ class SATpwn(plugins.Plugin):
     ACTIVITY_THRESHOLD = 5
     ACTIVITY_WINDOW_SECONDS = 300
 
+    ATTACK_ATTRIBUTION_WINDOW_SECONDS = 60
+    DASHBOARD_MAX_APS = 15
+    EXECUTOR_MAX_WORKERS = 3
+    MEMORY_SAVE_INTERVAL_SECONDS = 300
+
     def __init__(self):
         self.ready = False
         self.agent = None
         self.memory = {}
+        self._memory_lock = threading.Lock()
         self.modes = ['strict', 'loose', 'drive-by', 'recon', 'auto']
         self.memory_path = '/etc/pwnagotchi/SATpwn_memory.json'
-        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.executor = ThreadPoolExecutor(max_workers=self.EXECUTOR_MAX_WORKERS)
         self.mode = self.modes[0]
         self.channel_stats = {}
         self.memory_is_dirty = True
@@ -62,9 +69,10 @@ class SATpwn(plugins.Plugin):
         self.home_whitelist = set()
         self._current_auto_submode = None
         self._stationary_start = None
+        self._last_saved = 0
 
         self.plugin_enabled = True
-        
+
         self.attack_count = 0
         self.attack_success_count = 0
 
@@ -210,6 +218,25 @@ class SATpwn(plugins.Plugin):
         except Exception as e:
             logging.error(f"[SATpwn] Error saving memory: {e}")
 
+    def _validate_memory_schema(self, ap_data):
+        """Sanitize loaded AP memory, dropping malformed entries."""
+        if not isinstance(ap_data, dict):
+            logging.warning("[SATpwn] ap_data is not a dict, resetting memory")
+            return {}
+        cleaned = {}
+        for ap_mac, ap in ap_data.items():
+            if not isinstance(ap, dict):
+                continue
+            if not isinstance(ap.get('clients', {}), dict):
+                ap['clients'] = {}
+            ap.setdefault('clients', {})
+            ap.setdefault('last_seen', 0)
+            ap.setdefault('handshakes', 0)
+            ap.setdefault('channel', 0)
+            ap.setdefault('ssid', '')
+            cleaned[ap_mac] = ap
+        return cleaned
+
     def _load_memory(self):
         """Load persisted plugin state and AP/client memory from disk."""
         if os.path.exists(self.memory_path):
@@ -219,7 +246,7 @@ class SATpwn(plugins.Plugin):
 
                 if "plugin_metadata" in data:
                     metadata = data["plugin_metadata"]
-                    self.memory = data.get("ap_data", {})
+                    self.memory = self._validate_memory_schema(data.get("ap_data", {}))
                     saved_mode = metadata.get("current_mode", self.modes[0])
                     if saved_mode in self.modes:
                         self.mode = saved_mode
@@ -229,7 +256,7 @@ class SATpwn(plugins.Plugin):
                     self.attack_count = metadata.get("attack_count", 0)
                     self.attack_success_count = metadata.get("attack_success_count", 0)
                 else:
-                    self.memory = data
+                    self.memory = self._validate_memory_schema(data)
                     self.mode = self.modes[0]
                     self.attack_count = 0
                     self.attack_success_count = 0
@@ -264,8 +291,6 @@ class SATpwn(plugins.Plugin):
 
         # Remove expired clients from remaining APs
         for ap_mac in list(self.memory.keys()):
-            if ap_mac not in self.memory: 
-                continue
             clients = self.memory[ap_mac].get("clients", {})
             expired_clients = [client_mac for client_mac, data in clients.items()
                                if now - data.get("last_seen", 0) > client_expiry]
@@ -331,7 +356,9 @@ class SATpwn(plugins.Plugin):
                     break
             
             if target_ap and target_client:
-                # Execute deauth - NO RATE LIMITING
+                with self._memory_lock:
+                    if ap_mac in self.memory and client_mac in self.memory[ap_mac].get('clients', {}):
+                        self.memory[ap_mac]['clients'][client_mac]['last_attempt'] = time.time()
                 agent.deauth(target_ap, target_client)
                 self.attack_count += 1
                 logging.info(f"[SATpwn] Attack #{self.attack_count}: {client_mac} via {ap_mac}")
@@ -421,71 +448,77 @@ class SATpwn(plugins.Plugin):
 
         now = time.time()
         new_ap_count = 0
+        pending_attacks = []
 
         try:
-            for ap in access_points:
-                ap_mac = ap['mac'].lower()
-                if ap_mac not in self.memory:
-                    new_ap_count += 1
-                    self.memory[ap_mac] = {
-                        "ssid": ap.get('hostname', ''), 
-                        "channel": ap.get('channel', 0), 
-                        "clients": {}, 
-                        "last_seen": now, 
-                        "handshakes": 0
-                    }
-                else:
-                    self.memory[ap_mac].update({
-                        'last_seen': now, 
-                        'ssid': ap.get('hostname', ''), 
-                        'channel': ap.get('channel', 0)
-                    })
-
-                for client in ap.get('clients', []):
-                    client_mac = client['mac'].lower()
-
-                    if client_mac not in self.memory[ap_mac]['clients']:
-                        self.memory[ap_mac]['clients'][client_mac] = {
-                            "last_seen": now, 
-                            "signal": client.get('rssi', -100), 
-                            "score": 0, 
-                            "last_attempt": 0, 
-                            "last_success": 0,
-                            "last_recalculated": 0
+            with self._memory_lock:
+                for ap in access_points:
+                    ap_mac = ap['mac'].lower()
+                    if ap_mac not in self.memory:
+                        new_ap_count += 1
+                        self.memory[ap_mac] = {
+                            "ssid": ap.get('hostname', ''),
+                            "channel": ap.get('channel', 0),
+                            "clients": {},
+                            "last_seen": now,
+                            "handshakes": 0
                         }
                     else:
-                        self.memory[ap_mac]['clients'][client_mac].update({
-                            'last_seen': now, 
-                            'signal': client.get('rssi', -100)
+                        self.memory[ap_mac].update({
+                            'last_seen': now,
+                            'ssid': ap.get('hostname', ''),
+                            'channel': ap.get('channel', 0)
                         })
+                        self.memory[ap_mac].setdefault('clients', {})
 
-                    client_data = self.memory[ap_mac]['clients'][client_mac]
+                    for client in ap.get('clients', []):
+                        client_mac = client['mac'].lower()
 
-                    # Throttle score recalculation to reduce CPU overhead
-                    last_recalculated = client_data.get('last_recalculated', 0)
-                    if now - last_recalculated > self.SCORE_RECALCULATION_INTERVAL_SECONDS:
-                        score = self._recalculate_client_score(ap_mac, client_mac)
-                        client_data['last_recalculated'] = now
-                    else:
-                        score = client_data.get('score', 0)
+                        if client_mac not in self.memory[ap_mac]['clients']:
+                            self.memory[ap_mac]['clients'][client_mac] = {
+                                "last_seen": now,
+                                "signal": client.get('rssi', -100),
+                                "score": 0,
+                                "last_attempt": 0,
+                                "last_success": 0,
+                                "last_recalculated": 0
+                            }
+                        else:
+                            self.memory[ap_mac]['clients'][client_mac].update({
+                                'last_seen': now,
+                                'signal': client.get('rssi', -100)
+                            })
 
-                    # Determine attack thresholds based on current mode
-                    last_attempt = client_data.get('last_attempt', 0)
-                    attack_score_threshold = (self.DRIVE_BY_ATTACK_SCORE_THRESHOLD 
-                                            if self.mode == 'drive-by' 
-                                            else self.ATTACK_SCORE_THRESHOLD)
-                    attack_cooldown = (self.DRIVE_BY_ATTACK_COOLDOWN_SECONDS 
-                                     if self.mode == 'drive-by' 
-                                     else self.ATTACK_COOLDOWN_SECONDS)
+                        client_data = self.memory[ap_mac]['clients'][client_mac]
 
-                    # Submit attack if criteria met - per-client cooldown prevents redundancy
-                    if score >= attack_score_threshold and (now - last_attempt > attack_cooldown):
-                        client_data['last_attempt'] = now
-                        self.executor.submit(self._execute_attack, agent, ap_mac, client_mac)
+                        # Force recalculation if score was never set, otherwise throttle
+                        last_recalculated = client_data.get('last_recalculated', 0)
+                        if last_recalculated == 0 or client_data.get('score') is None or \
+                                now - last_recalculated > self.SCORE_RECALCULATION_INTERVAL_SECONDS:
+                            score = self._recalculate_client_score(ap_mac, client_mac)
+                            client_data['last_recalculated'] = now
+                        else:
+                            score = client_data.get('score', 0)
 
-            self._update_activity_history(new_ap_count)
-            self.memory_is_dirty = True
-            
+                        # Determine attack thresholds based on current mode
+                        last_attempt = client_data.get('last_attempt', 0)
+                        attack_score_threshold = (self.DRIVE_BY_ATTACK_SCORE_THRESHOLD
+                                                  if self.mode == 'drive-by'
+                                                  else self.ATTACK_SCORE_THRESHOLD)
+                        attack_cooldown = (self.DRIVE_BY_ATTACK_COOLDOWN_SECONDS
+                                           if self.mode == 'drive-by'
+                                           else self.ATTACK_COOLDOWN_SECONDS)
+
+                        if score >= attack_score_threshold and (now - last_attempt > attack_cooldown):
+                            pending_attacks.append((ap_mac, client_mac))
+
+                self._update_activity_history(new_ap_count)
+                self.memory_is_dirty = True
+
+            # Submit attacks outside the lock so threads don't contend on acquisition
+            for ap_mac, client_mac in pending_attacks:
+                self.executor.submit(self._execute_attack, agent, ap_mac, client_mac)
+
         except Exception as e:
             logging.error(f"[SATpwn] WiFi update error: {e}")
 
@@ -497,26 +530,24 @@ class SATpwn(plugins.Plugin):
         try:
             ap_mac = ap['mac'].lower()
             client_mac = client['mac'].lower()
-            
-            # Increment AP handshake counter
-            if ap_mac in self.memory:
-                self.memory[ap_mac]['handshakes'] = self.memory[ap_mac].get('handshakes', 0) + 1
 
-            # Check if handshake resulted from our recent attack
-            if (ap_mac in self.memory and 
-                client_mac in self.memory[ap_mac]['clients']):
-                
-                last_attempt = self.memory[ap_mac]['clients'][client_mac].get('last_attempt', 0)
-                if time.time() - last_attempt < 60:
-                    self.attack_success_count += 1
-                    logging.info(f"[SATpwn] Success! {self.attack_success_count}/{self.attack_count}")
-                
-                # Mark success and boost future targeting priority
-                self.memory[ap_mac]['clients'][client_mac]['last_success'] = time.time()
-                self._recalculate_client_score(ap_mac, client_mac)
+            with self._memory_lock:
+                if ap_mac in self.memory:
+                    self.memory[ap_mac]['handshakes'] = self.memory[ap_mac].get('handshakes', 0) + 1
 
-            self.memory_is_dirty = True
-            
+                if (ap_mac in self.memory and
+                        client_mac in self.memory[ap_mac].get('clients', {})):
+
+                    last_attempt = self.memory[ap_mac]['clients'][client_mac].get('last_attempt', 0)
+                    if time.time() - last_attempt < self.ATTACK_ATTRIBUTION_WINDOW_SECONDS:
+                        self.attack_success_count += 1
+                        logging.info(f"[SATpwn] Success! {self.attack_success_count}/{self.attack_count}")
+
+                    self.memory[ap_mac]['clients'][client_mac]['last_success'] = time.time()
+                    self._recalculate_client_score(ap_mac, client_mac)
+
+                self.memory_is_dirty = True
+
         except Exception as e:
             logging.error(f"[SATpwn] Handshake processing error: {e}")
 
@@ -592,13 +623,15 @@ class SATpwn(plugins.Plugin):
             return
 
         try:
-            next_channel = next(self.recon_channel_iterator)
-            if next_channel not in self.recon_channels_tested:
-                self.recon_channels_tested.append(next_channel)
-                agent.set_channel(next_channel)
-            else:
-                # Skip already tested channel
-                self._epoch_recon(agent, epoch, epoch_data, supported_channels)
+            # Iterate (not recurse) to skip already-tested channels
+            max_tries = len(supported_channels) + 1
+            for _ in range(max_tries):
+                next_channel = next(self.recon_channel_iterator)
+                if next_channel not in self.recon_channels_tested:
+                    self.recon_channels_tested.append(next_channel)
+                    agent.set_channel(next_channel)
+                    return
+            self._epoch_strict(agent, epoch, epoch_data, supported_channels)
         except StopIteration:
             self._epoch_strict(agent, epoch, epoch_data, supported_channels)
 
@@ -609,7 +642,9 @@ class SATpwn(plugins.Plugin):
 
         try:
             self._cleanup_memory()
-            self._save_memory()
+            if time.time() - self._last_saved > self.MEMORY_SAVE_INTERVAL_SECONDS:
+                self._save_memory()
+                self._last_saved = time.time()
 
             supported_channels = agent.supported_channels()
             if not supported_channels:
@@ -693,19 +728,22 @@ class SATpwn(plugins.Plugin):
             </div></body></html>
             """, mimetype='text/html')
 
-        # Update stats
-        if self.memory_is_dirty or not self.channel_stats:
-            self.channel_stats = self._get_channel_stats()
-            self.memory_is_dirty = False
+        # Snapshot memory under lock to avoid concurrent modification during rendering
+        with self._memory_lock:
+            if self.memory_is_dirty or not self.channel_stats:
+                self.channel_stats = self._get_channel_stats()
+                self.memory_is_dirty = False
+            memory_snapshot = dict(self.memory)
+            channel_stats_snapshot = dict(self.channel_stats)
 
-        total_aps = len(self.memory)
-        total_clients = sum(len(ap.get('clients', {})) for ap in self.memory.values())
+        total_aps = len(memory_snapshot)
+        total_clients = sum(len(ap.get('clients', {})) for ap in memory_snapshot.values())
         success_rate = (self.attack_success_count / max(self.attack_count, 1) * 100) if self.attack_count > 0 else 0
 
         # Generate channel stats table
         channel_html = "<table><tr><th>Ch</th><th>APs</th><th>Clients</th><th>Handshakes</th></tr>"
-        if self.channel_stats:
-            for ch, stats in sorted(self.channel_stats.items()):
+        if channel_stats_snapshot:
+            for ch, stats in sorted(channel_stats_snapshot.items()):
                 channel_html += f"<tr><td>{ch}</td><td>{stats['aps']}</td><td>{stats['clients']}</td><td>{stats['handshakes']}</td></tr>"
         else:
             channel_html += "<tr><td colspan='4'>Gathering data...</td></tr>"
@@ -713,24 +751,23 @@ class SATpwn(plugins.Plugin):
 
         # Generate AP memory table sorted by highest client score
         memory_html = "<table><tr><th>AP</th><th>Ch</th><th>Clients</th><th>Max Score</th></tr>"
-        if self.memory:
-            # Sort by highest scoring client first, then by last_seen
+        if memory_snapshot:
             sorted_aps = sorted(
-                self.memory.items(),
+                memory_snapshot.items(),
                 key=lambda x: (
                     max((client.get('score', 0) for client in x[1].get('clients', {}).values()), default=0),
                     x[1].get('last_seen', 0)
                 ),
                 reverse=True
             )
-            for ap_mac, ap_data in sorted_aps[:15]:
+            for ap_mac, ap_data in sorted_aps[:self.DASHBOARD_MAX_APS]:
                 client_count = len(ap_data.get('clients', {}))
                 max_score = 0
                 if ap_data.get('clients'):
                     max_score = max(client.get('score', 0) for client in ap_data['clients'].values())
                 memory_html += f"<tr><td>{ap_data.get('ssid', 'N/A')}<br><small>{ap_mac[:17]}</small></td><td>{ap_data.get('channel', '-')}</td><td>{client_count}</td><td>{max_score:.1f}</td></tr>"
-            if len(self.memory) > 15:
-                memory_html += f"<tr><td colspan='4'><i>+{len(self.memory) - 15} more</i></td></tr>"
+            if len(memory_snapshot) > self.DASHBOARD_MAX_APS:
+                memory_html += f"<tr><td colspan='4'><i>+{len(memory_snapshot) - self.DASHBOARD_MAX_APS} more</i></td></tr>"
         else:
             memory_html += "<tr><td colspan='4'>No APs yet</td></tr>"
         memory_html += "</table>"
@@ -765,6 +802,7 @@ class SATpwn(plugins.Plugin):
         html = f"""
         <html>
         <head><title>SATpwn v{self.__version__}</title>
+        <meta http-equiv="refresh" content="30">
         <style>
         body{{font-family:monospace;background:#1e1e1e;color:#d4d4d4;margin:0;padding:20px;}}
         .container{{max-width:1200px;margin:0 auto;}}
