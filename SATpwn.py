@@ -57,6 +57,10 @@ class SATpwn(plugins.Plugin):
     }
     AP_MIN_ATTEMPTS_FOR_SHARE = 5   # attacks before share-based rate limiting kicks in
     AP_MIN_SHARE = 0.1              # struggling APs still get 10% of normal attack rate
+    # Only attack clients close enough to reliably receive deauth frames.
+    # Cutoff scales with aggression: strict requires a strong signal, drive-by reaches further.
+    MIN_ATTACK_RSSI_STRICT = -75    # dBm cutoff at aggression 0.0
+    MIN_ATTACK_RSSI_LOOSE = -85     # dBm cutoff at aggression 1.0
 
     def __init__(self):
         self.ready = False
@@ -208,6 +212,10 @@ class SATpwn(plugins.Plugin):
 
     def _effective_exploration(self):
         return 0.05 + (0.20 - 0.05) * self.aggression
+
+    def _effective_min_rssi(self):
+        """Minimum client RSSI to attack; weaker (more negative) cutoff at higher aggression."""
+        return self.MIN_ATTACK_RSSI_STRICT + (self.MIN_ATTACK_RSSI_LOOSE - self.MIN_ATTACK_RSSI_STRICT) * self.aggression
 
     def _save_memory(self):
         """Persist plugin state and AP/client memory to disk."""
@@ -483,6 +491,7 @@ class SATpwn(plugins.Plugin):
         # Pre-compute per-scan constants to avoid per-client method call overhead
         threshold = self._effective_threshold()
         cooldown = self._effective_cooldown()
+        min_rssi = self._effective_min_rssi()
         recalc_interval = self.SCORE_RECALCULATION_INTERVAL_SECONDS
 
         try:
@@ -545,6 +554,10 @@ class SATpwn(plugins.Plugin):
 
                         cd = ap_clients[client_mac]
 
+                        # Proximity gate: skip clients too far to reliably deauth
+                        if new_rssi < min_rssi:
+                            continue
+
                         last_recalculated = cd.get('last_recalculated', 0)
                         if last_recalculated == 0 or now - last_recalculated > recalc_interval:
                             score = self._recalculate_client_score(ap_mac, client_mac, now)
@@ -605,9 +618,11 @@ class SATpwn(plugins.Plugin):
                     # this is the best window to capture their handshakes too.
                     effective = self._current_submode if self.mode == 'auto' else self.mode
                     if effective not in ('recon',):
+                        min_rssi = self._effective_min_rssi()
                         for other_mac, other_cd in self.memory[ap_mac]['clients'].items():
                             if (other_mac != client_mac and
-                                    other_cd.get('last_success', 0) == 0):
+                                    other_cd.get('last_success', 0) == 0 and
+                                    other_cd.get('signal', -100) >= min_rssi):
                                 neighbor_targets.append(other_mac)
 
                 self.memory_is_dirty = True
@@ -906,6 +921,7 @@ class SATpwn(plugins.Plugin):
         <h2>Status</h2>
         <p><b>Thread Pool:</b> {self.EXECUTOR_MAX_WORKERS} workers</p>
         <p><b>Exploration:</b> {self._effective_exploration()*100:.0f}%</p>
+        <p><b>Min RSSI:</b> {self._effective_min_rssi():.0f} dBm</p>
         <p><b>Base Aggression:</b> {self._base_aggression:.2f}</p>
         </div>
         </div>
